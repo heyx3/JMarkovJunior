@@ -5,7 +5,7 @@
 	@fill 'R' uv(min=0.9, size=0)
 
 	# Grow the cave seeds and leave some veins behind.
-    @rewrite (area*6) begin
+    @rewrite (area*4.5) begin
         R[bI] => bR
 		IRb => G__
     end

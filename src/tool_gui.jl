@@ -19,6 +19,7 @@ mutable struct GuiMemory
     current_scene_file_name::String
     current_scene_src::String
     current_seed_src::String
+    new_scene_file_name::String
 
     is_playing::Bool
     ticks_per_second::Float32
@@ -30,6 +31,7 @@ GuiMemory() = GuiMemory(
     2, [ 64, 64 ],
     FALLBACK_SCENE_NAME, read(path_scene(FALLBACK_SCENE_NAME), String),
     "0x1234567890abcdef",
+    "MyScene",
     false, 150, 10, 1000, 10
 )
 StructTypes.StructType(::Type{GuiMemory}) = StructTypes.Mutable()
@@ -63,12 +65,13 @@ mutable struct GuiRunner
     current_seed::UInt64
     current_seed_display::String
     next_seed::GuiText
-
+    
     next_algorithm::GuiText
     next_algorithm_font::Ptr{CImGui.LibCImGui.ImFont}
     algorithm_error_msg::String
-
+    
     available_scenes::Vector{String}
+    next_scene_name::GuiText
     current_scene_idx::Int
     current_scene_has_changes::Bool
 
@@ -115,7 +118,9 @@ function GuiRunner(memory::GuiMemory,
 
         initial_error_msg,
 
-        available_scenes, scene_idx,
+        available_scenes,
+        GuiText(memory.new_scene_file_name),
+        scene_idx,
         # 'current_scene_has_changes' will be computed next.
         false,
 
@@ -624,7 +629,7 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
                         min=v2f(0, 0),
                         size=v2f(15, 15)
                     ), true),
-                    GuiDrawFilled(color)
+                    GuiDrawColorFilled(color)
                 )
                 CImGui.SameLine()
                 CImGui.Text(text)
@@ -677,6 +682,38 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             runner.current_scene_idx = next_scene_idx_c+1
             runner.memory.current_scene_file_name = runner.available_scenes[runner.current_scene_idx]
             update!(runner.next_algorithm, read(path_scene(runner.memory.current_scene_file_name), String))
+        end
+
+        was_new_scene_name_edited::Bool = gui_text!(runner.next_scene_name)
+        CImGui.SameLine(0, 20)
+        runner.memory.new_scene_file_name = string(runner.next_scene_name)
+        can_use_new_scene_name = none(c -> c in runner.memory.new_scene_file_name,
+                                      ('/', '\\', '*'))
+        if !can_use_new_scene_name && isempty(runner.algorithm_error_msg)
+            runner.algorithm_error_msg = "Invalid path chars in new scene name!"
+        end
+        if was_new_scene_name_edited && can_use_new_scene_name
+            can_use_new_scene_name = !isfile(path_scene(runner.memory.new_scene_file_name * ".jl"))
+            if !can_use_new_scene_name && isempty(runner.algorithm_error_msg)
+                runner.algorithm_error_msg = "File with that name already exists!"
+            end
+        end
+        if can_use_new_scene_name && CImGui.Button("Create scene")
+            try
+                new_scene_str = "@markovjunior begin\n\t@rewrite 1 b=>w\n\t@rewrite wb=>ww\nend"
+                open(io -> write(io, new_scene_str),
+                     path_scene(runner.memory.new_scene_file_name * ".jl"),
+                     "w")
+
+                # Switch to editing the new scene.
+                runner.memory.current_scene_file_name = runner.memory.new_scene_file_name * ".jl"
+                runner.memory.current_scene_src = new_scene_str
+                update!(runner.next_algorithm, new_scene_str)
+
+                update_gui_runner_scenes!(runner)
+            catch e
+                runner.algorithm_error_msg = "Unable to create file: $(sprint(showerror, e))"
+            end
         end
     end
 

@@ -63,7 +63,7 @@ function get_draw_box_pixels(space::E_DrawBoxSpace,
                 return Box(min=b_min, max=b_max)
             elseif R == Float32
                 b_min = convert(V, clamp(floor(V, mi), one(V), resolution))
-                b_max = convert(V, max(b_min, clamp(ceil(V, ma), one(V), resolution)))
+                b_max = convert(V, max(b_min, clamp(floor(V, ma), one(V), resolution)))
                 return Box(min=b_min, max=b_max)
             else
                 error("Unhandled: ", R)
