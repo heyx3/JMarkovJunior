@@ -91,6 +91,7 @@ export AbstractMarkovAllocator, AbstractMarkovBias, AbstractMarkovOp,
 # Tooling:
 if BUILT_WITH_TOOL
     include("tool_files.jl")
+    include("tool_render_3D.jl")
     include("tool_gui.jl")
     include("tool_main.jl")
     export markovjunior_run_tool

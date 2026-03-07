@@ -163,9 +163,9 @@ CellTypeSet(s::Symbol) = CellTypeSet(string(s))
 #####################################
 ##   Cell grid
 
-"A grid of cell values (by their code)"
+"An abstract grid of cell values (represented by their code)"
 const CellGrid{N} = AbstractArray{UInt8, N}
-"A standard heap-allocated grid of cell values (by their code)"
+"A contiguous heap-allocated grid of cell values (represented by their code)"
 const CellGridConcrete{N} = Array{UInt8, N}
 
 "Reference to a N-dimensional grid cell"

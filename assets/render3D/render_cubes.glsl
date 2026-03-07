@@ -1,0 +1,150 @@
+//Cubes will be rendered by dispatching 36 vertices per grid cell
+//  and discarding ones for the cells which represent air.
+
+#START_VERTEX
+
+#if !DEPTH_ONLY
+out ivec3 o_gridCell;
+out int o_cellValue;
+out vec3 o_gridPosF;
+out vec3 o_normal;
+out vec2 o_faceUV;
+#endif
+
+//You can discard primitives by positioning their vertices at NaN.
+#define MAKE_NAN32 (intBitsToFloat(int(0xFFC00000u)))
+
+void main() {
+    //Figure out what vertex this is.
+    int cubeIdx = (gl_VertexID / 36),    //Which cube?
+        faceIdx = (gl_VertexID / 6) % 6, //Which face of cube?
+        triIdx  = (gl_VertexID / 3) % 2, //Which tri of face?
+        vertIdx = (gl_VertexID % 3),     //Which vert of tri?
+        faceVertIdx = (gl_VertexID % 6); //Which vert of face?
+    int faceAxis = (faceIdx / 2),
+        faceDir = -1 + (2 * (faceIdx % 2));
+
+    //Read this grid cell.
+    usampler3D gridTex = usampler3D(u_data.grid_3D);
+    ivec3 gridResolution = textureSize(gridTex, 0);
+    ivec3 gridCell = ivec3(
+        cubeIdx % gridResolution.x,
+        (cubeIdx / gridResolution.x) % gridResolution.y,
+        (cubeIdx / (gridResolution.x * gridResolution.y)) % gridResolution.z
+    );
+    int cellValue = int(texelFetch(gridTex, gridCell, 0).r);
+
+    //If this cell is meant to be empty, discard the primitive.
+    if (u_data.cell_air_lookup[cellValue])
+    {
+        #if !DEPTH_ONLY
+            o_cellValue = cellValue;
+            o_gridCell = gridCell;
+            o_faceUV = vec2(0, 0);
+            o_gridPosF = vec3(0, 0, 0);
+            o_normal = vec3(0, 0, 0);
+        #endif
+        gl_Position = vec4(MAKE_NAN32, MAKE_NAN32, MAKE_NAN32, -1);
+        return;
+    }
+
+    //Calculate vertex data.
+    int faceIdcLookup[6] = {
+        0, 1, 2,
+        0, 2, 3
+    };
+    vec2 faceUVOptions[4] = {
+        vec2(0, 0),
+        vec2(0, 1),
+        vec2(1, 1),
+        vec2(1, 0)
+    };
+    ivec2 faceTangentAxesOptions[3] = {
+        ivec2(1, 2),
+        ivec2(0, 2),
+        ivec2(0, 1)
+    };
+    int elementIdx = faceIdcLookup[faceVertIdx];
+    ivec2 faceTangentAxes = faceTangentAxesOptions[faceAxis];
+
+    //Generate the fragment inputs.
+    vec2 faceUV = faceUVOptions[elementIdx];
+    vec3 gridPosF = vec3(gridCell);
+    gridPosF[faceTangentAxes.x] += faceUV.x;
+    gridPosF[faceTangentAxes.y] += faceUV.y;
+    #if !DEPTH_ONLY
+        o_normal = vec3(0, 0, 0);
+        o_normal[faceAxis] = float(faceDir);
+
+        o_cellValue = cellValue;
+        o_gridCell = gridCell;
+        o_faceUV = faceUV;
+        o_gridPosF = gridPosF;
+    #endif
+
+    gl_Position = u_data.matrix_view_proj * vec4(gridPosF, 1);
+}
+
+
+#START_FRAGMENT
+
+in flat ivec3 o_gridCell;
+in flat int o_cellValue;
+in vec3 o_gridPosF;
+in vec3 o_normal;
+in vec2 o_faceUV;
+
+#if !DEPTH_ONLY
+    out vec4 outColor;
+#endif
+
+void main() {
+#if !DEPTH_ONLY
+
+    //For now, look up color in a hard-coded table matching the 2D renderer.
+    vec3 pixelColorTable[] = {
+        vec3(0, 0, 0),
+        vec3(0.5, 0.5, 0.5),
+        vec3(1, 1, 1),
+
+        vec3(1, 0, 0),
+        vec3(0, 1, 0),
+        vec3(0, 0, 1),
+        vec3(1, 1, 0),
+        vec3(1, 0, 1),
+        vec3(0, 1, 1),
+
+        vec3(1, 0.5, 0),
+        vec3(1, 0, 0.5),
+
+        vec3(0, 0.5, 0.2),
+        vec3(0, 0.2, 0.5),
+        vec3(0.5, 0.2, 0),
+
+        vec3(1, 0.9, 0.8),
+        vec3(0.7, 0.85, 1)
+    };
+    vec3 albedo = pixelColorTable[o_cellValue];
+
+    //Make darker blocks metallic.
+    float metallic = step(0.3, max(albedo.x, max(albedo.y, albedo.z)));
+
+    //Make roughness based on the pixel's integer value.
+    float roughness = mix(0.15, 1.0, float(o_cellValue) / 16.0);
+
+    //Compute coordinate stuff.
+    vec3 fragToCamera = u_data.cam_pos - o_gridPosF;
+    float distToCamera = length(fragToCamera);
+    vec3 dirTowardsCamera = fragToCamera / max(0.000001, distToCamera);
+
+    //Compute lighting.
+    vec3 litColor = microfacetLighting(
+        o_normal, dirTowardsCamera,
+        -u_data.sun_dir, u_data.sun_color,
+        albedo, metallic, roughness
+    );
+
+    outColor = vec4(albedo, 1);
+
+#endif
+}

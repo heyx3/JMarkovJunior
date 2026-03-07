@@ -26,13 +26,16 @@ mutable struct GuiMemory
     ticks_per_jump::Int32
     ticks_for_profile::Int32
     max_seconds_for_run_to_end::Float32
+
+    rendering_dim::Int
 end
 GuiMemory() = GuiMemory(
     2, [ 64, 64 ],
     FALLBACK_SCENE_NAME, read(path_scene(FALLBACK_SCENE_NAME), String),
     "0x1234567890abcdef",
     "MyScene",
-    false, 150, 10, 1000, 10
+    false, 150, 10, 1000, 10,
+    2
 )
 StructTypes.StructType(::Type{GuiMemory}) = StructTypes.Mutable()
 
@@ -56,24 +59,27 @@ Base.copy(m::GuiMemory) = GuiMemory((
 mutable struct GuiRunner
     memory::GuiMemory
 
-    state_texture::Texture
-    state_texture_pixel_buffer::Array{v3f, 2}
-
     algorithm::MarkovAlgorithm
     algorithm_state::Optional{MarkovAlgoState}
 
     current_seed::UInt64
     current_seed_display::String
     next_seed::GuiText
-    
+
     next_algorithm::GuiText
     next_algorithm_font::Ptr{CImGui.LibCImGui.ImFont}
     algorithm_error_msg::String
-    
+
     available_scenes::Vector{String}
     next_scene_name::GuiText
     current_scene_idx::Int
     current_scene_has_changes::Bool
+
+    render_3D_assets::Render3D.App
+    rendering::Union{
+        Tuple{Val{2}, Array{v3f, 2}, Texture}, # 2D rendering
+        Tuple{Val{3}, Render3D.Scene, Render3D.Viewport} # 3D rendering
+    }
 
     time_till_next_tick::Float32
     textures_to_destroy::Vector{Texture} # Textures are deleted the frame *after* they're no longer used,
@@ -98,11 +104,9 @@ function GuiRunner(memory::GuiMemory,
         parse_markovjunior(read(path_scene(FALLBACK_SCENE_NAME), String))
     end
 
+    app = Render3D.App()
     runner = GuiRunner(
         memory,
-
-        Texture(SpecialFormats.rgb10_a2, 1), # 1D texture so the lazy-init logic catches it
-        fill(zero(v3f), memory.next_resolution...),
 
         parsed_algo, nothing,
 
@@ -124,20 +128,60 @@ function GuiRunner(memory::GuiMemory,
         # 'current_scene_has_changes' will be computed next.
         false,
 
+        app,
+        if memory.rendering_dim == 2
+            resolution_2D = ntuple(2) do i
+                if i > length(memory.next_resolution)
+                    1
+                else
+                    memory.next_resolution[i]
+                end
+            end
+            (
+                Val(2),
+                fill(zero(v3f), resolution_2D...),
+                # Make a 1D texture so the lazy-init logic catches and creates it for real.
+                Texture(SpecialFormats.rgb10_a2, 1)
+            )
+        elseif memory.rendering_dim == 3
+            (
+                Val(3),
+                Render3D.Scene(),
+                Render3D.Viewport(v2i(1200, 1200), v3f(3, 3, 3))
+            )
+        else
+            error("Unhandled: ", memory.rendering_dim)
+        end,
+
         -1.0f0,
         Vector{Texture}()
     )
 
     reset_gui_runner_algo(runner, true, false, true)
-    update_gui_runner_texture_2D(runner)
+    if runner.rendering[1] isa Val{2}
+        update_gui_runner_texture_2D(runner)
+    elseif runner.rendering[1] isa Val{3}
+        update_gui_runner_render_3D(runner, true)
+    else
+        error("Unhandled: ", typeof(runner.rendering))
+    end
     update_gui_runner_scenes!(runner)
 
     return runner
 end
 function Base.close(runner::GuiRunner)
-    close(runner.state_texture)
     exists(runner.algorithm_state) && close(runner.algorithm_state, runner.algorithm)
     foreach(close, runner.textures_to_destroy)
+    close(runner.render_3D_assets)
+
+    if runner.rendering[1] isa Val{2}
+        close(runner.rendering[1])
+    elseif runner.rendering[1] isa Val{3}
+        close(runner.rendering[2])
+        close(runner.rendering[3])
+    else
+        error("Unhandled: ", typeof(runner.rendering))
+    end
 end
 
 function query_available_scenes!(output::Vector{String}, empty_output_first::Bool=true)
@@ -177,46 +221,85 @@ function update_gui_runner_scenes!(runner::GuiRunner)
 end
 
 function update_gui_runner_texture_2D(runner::GuiRunner)
+    (_, array::Matrix{v3f}, tex::Texture) = runner.rendering
+
     # Generate the pixel buffer for upload to the GPU.
-    if vsize(runner.state_texture_pixel_buffer) != vsize(runner.algorithm_state.grid[])
-        runner.state_texture_pixel_buffer = fill(zero(v3f), runner.state_texture.size.xy...)
+    #  * Figure out the resolution it should have:
+    resolution_2D = if ndims(runner.algorithm_state.grid[]) == 1
+        Vec(length(runner.algorithm_state.grid[]), 1)
+    else
+        Vec(size(runner.algorithm_state.grid[])[1:2]...)
     end
+    #  * Reallocate if necessary:
+    if vsize(array) != resolution_2D
+        array = fill(zero(v3f), resolution_2D...)
+    end
+    #  * Update the contents:
     convert_pixel(u::UInt8) = if u == CELL_CODE_INVALID
         v3f(1, 0, 1)
     else
         CELL_TYPES[u+1].color
     end
-
     N = ndims(runner.algorithm_state.grid[])
     if N < 3
-        runner.state_texture_pixel_buffer .= convert_pixel.(runner.algorithm_state.grid[])
+        array .= convert_pixel.(runner.algorithm_state.grid[])
     else
-        runner.state_texture_pixel_buffer .= convert_pixel.(runner.algorithm_state.grid[])[
+        array .= convert_pixel.(runner.algorithm_state.grid[])[
             :, :,
             (1 for i in 3:N)...
         ]
     end
  
     # Update the GPU texture.
-    if (runner.state_texture.type != TexTypes.twoD) || (runner.state_texture.size.xy != vsize(runner.algorithm_state.grid[]).xy)
-        push!(runner.textures_to_destroy, runner.state_texture)
-        runner.state_texture = Texture(
+    if (tex.type != TexTypes.twoD) || (tex.size.xy != vsize(runner.algorithm_state.grid[]).xy)
+        push!(runner.textures_to_destroy, tex)
+        tex = Texture(
             SimpleFormat(
                 FormatTypes.normalized_uint,
                 SimpleFormatComponents.RGB,
                 SimpleFormatBitDepths.B8
             ),
-            runner.state_texture_pixel_buffer,
-            sampler = TexSampler{ndims(runner.algorithm_state.grid[])}(
+            array,
+            sampler = TexSampler{2}(
                 pixel_filter = PixelFilters.rough
             ),
             n_mips = 1
         )
     else
-        set_tex_pixels(runner.state_texture, runner.state_texture_pixel_buffer)
+        set_tex_pixels(tex, array)
     end
 
+    runner.rendering = (Val(2), array, tex)
     return nothing
+end
+
+function update_gui_runner_render_3D(runner::GuiRunner, rerender_view::Bool)
+    (_, scene::Render3D.Scene, viewport::Render3D.Viewport) = runner.rendering
+
+    # Get a 3D view of the grid.
+    grid_slice = runner.algorithm_state.grid[]
+    if ndims(grid_slice) < 3
+        grid_slice = reshape(
+            grid_slice,
+            size(grid_slice)...,
+            (1 for i in (ndims(grid_slice)+1):3)...
+        )
+    elseif ndims(grid_slice) > 3
+        grid_slice = @view grid_slice[
+            :, :, :,
+            (1 for i in 4:ndims(grid_slice))...
+        ]
+    end
+
+    grid_is_new = (size(grid_slice) != tuple(scene.grid_tex_3D.size.xyz...))
+    Render3D.update_scene_grid!(scene, grid_slice)
+    grid_is_new && Render3D.on_new_grid!(viewport, Vec(size(grid_slice)...))
+    if rerender_view
+        Render3D.render(runner.render_3D_assets, scene, viewport)
+    end
+
+    runner.memory.rendering_dim = 3
+    runner.rendering = (Val(3), scene, viewport)
 end
 
 function reset_gui_runner_algo(runner::GuiRunner,
@@ -285,16 +368,28 @@ function reset_gui_runner_algo(runner::GuiRunner,
 
     # Finally, we can start the algorithm!
     runner.algorithm_state = markov_algo_start(runner.algorithm, Tuple(new_resolution), runner.current_seed)
-    if size(runner.algorithm_state.grid[]) != size(runner.state_texture_pixel_buffer)
-        runner.state_texture_pixel_buffer = let N = ndims(runner.algorithm_state.grid[])
-            if N == 1
-                fill(zero(v3f), length(runner.algorithm_state.grid[]), 1)
-            elseif N == 2
-                fill(zero(v3f), size(runner.algorithm_state.grid[]))
-            else
-                fill(zero(v3f), size(runner.algorithm_state.grid[])[1:2])
+
+    # Configure rendering.
+    #TODO: Inspect @pragma statements in the algorithm for render hints, otherwise use fixed/min dimensions of the algo, otherwise use current renderer
+    if runner.rendering[1] isa Val{2}
+        (_, array, tex) = runner.rendering
+        if size(runner.algorithm_state.grid[]) != size(array)
+            array = let N = ndims(runner.algorithm_state.grid[])
+                if N == 1
+                    fill(zero(v3f), length(runner.algorithm_state.grid[]), 1)
+                elseif N == 2
+                    fill(zero(v3f), size(runner.algorithm_state.grid[]))
+                else
+                    fill(zero(v3f), size(runner.algorithm_state.grid[])[1:2])
+                end
             end
         end
+        runner.rendering = (Val(2), array, tex)
+        runner.memory.rendering_dim = 2
+    elseif runner.rendering[1] isa Val{3}
+        update_gui_runner_render_3D(runner, true)
+    else
+        error("Unhandled: ", typeof(runner.rendering))
     end
 
     return nothing
@@ -306,11 +401,11 @@ function step_gui_runner_algo(runner::GuiRunner, n_iterations::Int)
 
     return nothing
 end
-function finish_gui_runner_algo(runner::GuiRunner, should_update_texture::Ref{Bool})
+function finish_gui_runner_algo(runner::GuiRunner, grid_has_changed::Ref{Bool})
     start_t = time()
     while !gui_runner_is_finished(runner)
         step_gui_runner_algo(runner, 50) #TODO: gradually increase tick count and time it
-        should_update_texture[] = true
+        grid_has_changed[] = true
 
         if (time() - start_t) > runner.memory.max_seconds_for_run_to_end
             runner.algorithm_error_msg = string(
@@ -336,6 +431,14 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
     foreach(close, runner.textures_to_destroy)
     empty!(runner.textures_to_destroy)
 
+    # Update the 3D renderer if applicable.
+    if runner.rendering[1] isa Val{3}
+        (_, scene_3D, viewport_3D) = runner.rendering
+
+        Render3D.tick_scene!(scene_3D, delta_seconds)
+        Render3D.render(runner.render_3D_assets, scene_3D, viewport_3D)
+    end
+
     gui_next_window_space(
         Box2Df(
             min=v2f(0, 0),
@@ -347,16 +450,74 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
         content_size = convert(v2f, CImGui.GetContentRegionAvail())
         print_wnd_sizes && println("Rnn: ", CImGui.GetWindowSize())
 
-        should_update_texture = Ref(false)
+        grid_has_changed = Ref(false)
+
+        # Render settings:
+        if runner.rendering[1] isa Val{2}
+            if CImGui.Button("Switch to 3D", v2f(100, 27))
+                # Close the 2D renderer.
+                (_, pixel_buf, tex_2D) = runner.rendering
+                push!(runner.textures_to_destroy, tex_2D)
+
+                # Allocate a 3D renderer.
+                runner.rendering = (
+                    Val(3),
+                    Render3D.Scene(),
+                    Render3D.Viewport(v2i(1200, 1200), v3f(3, 3, 3))
+                )
+                (_, scene::Render3D.Scene, viewport::Render3D.Viewport) = runner.rendering
+
+                update_gui_runner_render_3D(runner, true)
+            end
+        elseif runner.rendering[1] isa Val{3}
+            if CImGui.Button("Switch to 2D", v2f(100, 27))
+                # Close the 3D renderer.
+                (_, scene, viewport) = runner.rendering
+                close(viewport)
+                close(scene)
+
+                # Allocate a 2D renderer.
+                # Use a BS format for the texture so that the update function notices and lazy-initializes it.
+                runner.rendering = (
+                    Val(2),
+                    fill(zero(v3f), 1, 1),
+                    Texture(SpecialFormats.rgb10_a2, v3u(1, 1, 1))
+                )
+
+                # Initialize the 2D renderer.
+                update_gui_runner_texture_2D(runner)
+                runner.memory.rendering_dim = 2
+            end
+        else
+            error("Unhandled: ", typeof(runner.rendering))
+        end
 
         # Current state:
-        img_size = convert(v2f, runner.state_texture.size.xy)
-        min_img_size::Float32 = content_size.x - 10
-        scale::Float32 = max(1.0f0, (min_img_size / img_size)...)
-        @set! img_size *= scale
-        CImGui.Image(gui_tex_handle(runner.state_texture),
+        (img_size, display_tex, flip_uv_y) =
+            if runner.rendering[1] isa Val{2}
+                (_, array, tex) = runner.rendering
+                (convert(v2f, tex.size.xy), tex, false)
+            elseif runner.rendering[1] isa Val{3}
+                (_, scene_3D, viewport_3D) = runner.rendering
+                (convert(v2f, viewport_3D.view_color.size.xy), viewport_3D.view_color, true)
+            else
+                error("Unhandled: ", typeof(runner.rendering))
+            end
+        img_size = if runner.rendering[1] isa Val{2}
+            # Scale up but never down; don't lose pixels
+            min_img_size::Float32 = content_size.x - 10
+            img_size * max(1.0f0, (min_img_size / img_size)...)
+        elseif runner.rendering[1] isa Val{3}
+            # Scale up/down to fit the content window.
+            sz = v2f(content_size.x - 10, content_size.y - 300)
+            v2f(i -> max(256.0f0, min(sz...)))
+        else
+            error("Unhandled: ", typeof(runner.rendering))
+        end
+        #TODO: Recreate the 3D viewport (if using 3D) to match the display size (if it changed)
+        CImGui.Image(gui_tex_handle(display_tex),
                      convert(gVec2, img_size),
-                     gVec2(0, 0), gVec2(1, 1),
+                     gVec2(0, flip_uv_y ? 1 : 0), gVec2(1, flip_uv_y ? 0 : 1),
                      gVec4(1, 1, 1, 1), gVec4(0, 0, 0, 0))
 
         CImGui.Separator()
@@ -367,7 +528,7 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             n_ticks = 0
             while runner.time_till_next_tick <= 0
                 n_ticks += 1
-                should_update_texture[] = true
+                grid_has_changed[] = true
                 runner.time_till_next_tick += 1.0f0 / runner.memory.ticks_per_second
             end
             step_gui_runner_algo(runner, n_ticks)
@@ -409,7 +570,7 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             CImGui.SetNextItemWidth(-1)
             if CImGui.Button("Step", BUTTON_SIZE_RUN_PLAIN)
                 step_gui_runner_algo(runner, 1)
-                should_update_texture[] = true
+                grid_has_changed[] = true
             end
         CImGui.TableNextColumn()
         CImGui.TableNextColumn()
@@ -418,7 +579,7 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             gui_with_style(CImGui.LibCImGui.ImGuiCol_Button, BUTTON_COLOR_RUN_SPECIAL) do
                 if CImGui.Button("Reset", BUTTON_SIZE_RUN_SPECIAL)
                     reset_gui_runner_algo(runner, false, false, false)
-                    should_update_texture[] = true
+                    grid_has_changed[] = true
                 end
             end
         CImGui.TableNextColumn()
@@ -429,7 +590,7 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             CImGui.SetNextItemWidth(-1)
             if CImGui.Button("Jump", BUTTON_SIZE_RUN_PLAIN)
                 step_gui_runner_algo(runner, convert(Int, runner.memory.ticks_per_jump))
-                should_update_texture[] = true
+                grid_has_changed[] = true
             end
         CImGui.TableNextColumn()
             CImGui.Dummy(0, UNITS_VPAD)
@@ -503,7 +664,7 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             if gui_with_style(() -> CImGui.Button("Run to End", BUTTON_SIZE_RUN_SPECIAL),
                               LCIG.ImGuiCol_Button, BUTTON_COLOR_RUN_SPECIAL)
             #begin
-                finish_gui_runner_algo(runner, should_update_texture)
+                finish_gui_runner_algo(runner, grid_has_changed)
             end
         CImGui.TableNextColumn()
             CImGui.Dummy(0, UNITS_VPAD)
@@ -549,14 +710,14 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
                             unchanged = seed_has_changed)
             #begin
                 reset_gui_runner_algo(runner, true, false, false)
-                should_update_texture[] = true
+                grid_has_changed[] = true
             end
             if CImGui.Button("Reset with rnd seed", v2f(150, 32))
                 runner.memory.current_seed_src = string(rand(UInt64))
                 update!(runner.next_seed, runner.memory.current_seed_src)
 
                 reset_gui_runner_algo(runner, true, false, false)
-                should_update_texture[] = true
+                grid_has_changed[] = true
             end
         end
 
@@ -602,13 +763,45 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
           gui_with_style(CImGui.LibCImGui.ImGuiCol_ButtonActive, v3f(0.2, 0.1, 0.1), unchanged=resolution_is_different) do
             if CImGui.Button("Reset with new size", v2f(150, 25)) && resolution_is_different
                 reset_gui_runner_algo(runner, false, false, true)
-                should_update_texture[] = true
+                grid_has_changed[] = true
             end
         end end end
 
+        # Debug widgets:
+        CImGui.Dummy(1, 50)
+        CImGui.Separator(); CImGui.SameLine(30); CImGui.Text("DEBUG")
+        @markovjunior_debug() && gui_with_style(CImGui.LibCImGui.ImGuiCol_Button, v3f(0.2, 0.2, 0.2)) do
+            render_tex = if runner.rendering[1] isa Val{2}
+                runner.rendering[3]
+            elseif runner.rendering[1] isa Val{3}
+                runner.rendering[3].view_color
+            else
+                error("Unhandled: ", typeof(runner.rendering))
+            end
+            if CImGui.Button("Log GUI draw calls", (200, 30))
+                println(stderr, "LOGGING WITH RENDER TEX ID ",
+                        gui_tex_handle(render_tex))
+                service_GUI().debug_log_render_commands = true
+            end
+            if CImGui.Button("Log center-pixel of render", (300, 30))
+                values = fill(zero(v4f), 1, 1)
+                pixel_pos = round(v2u, render_tex.size.xy / 2)
+                get_tex_color(render_tex, values, TexSubset(
+                    Box(center=pixel_pos, size=one(v2u))
+                ))
+                println(stderr, "Render at pixel ", pixel_pos, ": ", values[1, 1])
+            end
+        end
+
         # Update the state texture, if any above code changed the state.
-        if should_update_texture[]
-            update_gui_runner_texture_2D(runner)
+        if grid_has_changed[]
+            if runner.rendering[1] isa Val{2}
+                update_gui_runner_texture_2D(runner)
+            elseif runner.rendering[1] isa Val{3}
+                update_gui_runner_render_3D(runner, true)
+            else
+                error("Unhandled: ", typeof(runner.rendering))
+            end
         end
     end
 
@@ -735,7 +928,13 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
 
         if CImGui.Button("Restart##WithNewAlgorithm")
             reset_gui_runner_algo(runner, false, true, true)
-            update_gui_runner_texture_2D(runner)
+            if runner.rendering[1] isa Val{2}
+                update_gui_runner_texture_2D(runner)
+            elseif runner.rendering[1] isa Val{3}
+                update_gui_runner_render_3D(runner, true)
+            else
+                error("Unhandled: ", typeof(runner.rendering))
+            end
         end
         CImGui.SameLine(0, 20)
         if CImGui.Button("Restart and Finish##WithNewAlgorithm")
@@ -743,7 +942,13 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
             if isempty(runner.algorithm_error_msg)
                 finish_gui_runner_algo(runner, Ref(false))
             end
-            update_gui_runner_texture_2D(runner)
+            if runner.rendering[1] isa Val{2}
+                update_gui_runner_texture_2D(runner)
+            elseif runner.rendering[1] isa Val{3}
+                update_gui_runner_render_3D(runner, true)
+            else
+                error("Unhandled: ", typeof(runner.rendering))
+            end
         end
     end
 
