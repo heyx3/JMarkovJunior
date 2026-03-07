@@ -114,11 +114,8 @@ function visit_rule_match_data(process_candidate::TLambda,
         end
         @set! last_pos[dir.axis] = clamp(last_pos[dir.axis], clamp_range...)
 
-        @markovjunior_assert(
-            (first_pos, last_pos) == minmax(first_pos, last_pos),
-            "Mismatch! $((first_pos, last_pos))"
-        )
-
+        # Note that if first_pos isn't completely behind last_pos, it means
+        #    the rule can't fit in the grid along this direction.
         for rule_start_pos::CellIdx{NDims} in first_pos:last_pos
             if isnothing(grid_mask) || grid_mask[rule_start_pos] <= rule_chosen_mask
                 user_out = process_candidate(rule_start_pos, dir,
