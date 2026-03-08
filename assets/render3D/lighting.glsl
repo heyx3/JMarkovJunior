@@ -95,15 +95,22 @@ vec3 computeAmbient(vec3 surfacePos, vec3 normal, vec3 albedo)
 
 //Computes shadow-maps.
 //Returns a 0-1 mask (0 is total shadow, 1 is fully-lit).
-// float computeShadows(vec3 worldPos) {
-//     worldPos -= (u_sun.dir.xyz * u_sun.shadowBias);
+float computeShadows(vec3 worldPos, vec3 worldLightDir,
+                     sampler2DShadow shadowmap, mat4 worldToShadowTexel,
+                     float shadowWorldBias) {
+    worldPos -= (worldLightDir * shadowWorldBias);
 
-//     vec4 texel4 = u_sun.worldToTexelMat * vec4(worldPos, 1);
-//     vec3 texel = texel4.xyz / texel4.w;
-//     float shadowMask = texture(u_sun.shadowmap, texel).r;
+    vec4 texel4 = worldToShadowTexel * vec4(worldPos, 1);
+    vec3 texel = texel4.xyz / texel4.w;
+    //texel.y = 1.0 - texel.y;
 
-//     return shadowMask;
-// }
+    //We calculate the shadowmap bounds to exactly cover the level bounds.
+    //If the position is outside the view of the shadow-map, then it is not in shadow.
+    if (any(lessThan(texel.xy, vec2(0))) || any(greaterThan(texel.xy, vec2(1))))
+        return 1.0;
+    float shadowMask = textureLod(shadowmap, texel, 0);
+    return shadowMask;
+}
 
 //Computes sky color.
 vec3 computeSkyColor(vec3 dirToSky, vec3 dirToSun)

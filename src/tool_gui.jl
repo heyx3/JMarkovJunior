@@ -9,6 +9,9 @@ end
 const gVec2 = Bplus.GUI.gVec2
 const gVec4 = Bplus.GUI.gVec4
 
+"A color that indicates a GUI widget is debug-only"
+const GUI_DEBUG_COLOR = v3f(0.2, 0.2, 0.2)
+
 "User state that should persist between program runs; serializable to/from JSON"
 mutable struct GuiMemory
     #TODO: Window size/fullscreen
@@ -62,6 +65,7 @@ Base.copy(m::GuiMemory) = GuiMemory((
 "The state of the GUI for our MarkovJunior tool"
 mutable struct GuiRunner
     memory::GuiMemory
+    elapsed_seconds::Float32
 
     algorithm::MarkovAlgorithm
     algorithm_state::Optional{MarkovAlgoState}
@@ -82,10 +86,14 @@ mutable struct GuiRunner
     render_3D_assets::Render3D.App
     rendering::Union{
         Tuple{Val{2}, Array{v3f, 2}, Texture}, # 2D rendering
-        Tuple{Val{3}, Render3D.Scene, Render3D.Viewport} # 3D rendering
+        Tuple{Val{3}, Render3D.Scene, Render3D.FullViewport} # 3D rendering
     }
     render_settings_are_open::Bool
     reset_render_settings_window::Bool
+
+    visualize_shadowmap_instead::Bool
+    visualized_shadowmap::Texture
+    visualized_shadowmap_target::Target
 
     time_till_next_tick::Float32
     textures_to_destroy::Vector{Texture} # Textures are deleted the frame *after* they're no longer used,
@@ -113,6 +121,7 @@ function GuiRunner(memory::GuiMemory,
     app = Render3D.App()
     runner = GuiRunner(
         memory,
+        0.0f0,
 
         parsed_algo, nothing,
 
@@ -156,12 +165,25 @@ function GuiRunner(memory::GuiMemory,
                     sun_dir=memory.render3D_sun_dir,
                     sun_color=memory.render3D_sun_color
                 ),
-                Render3D.Viewport(v2i(1200, 1200), v3f(3, 3, 3))
+                Render3D.FullViewport(v2i(1200, 1200), v3f(3, 3, 3))
             )
         else
             error("Unhandled: ", memory.rendering_dim)
         end,
         false, false,
+
+        false,
+        begin
+            t = Texture(
+                SpecialFormats.rgb10_a2,
+                v2u(1, 1),
+                sampler = TexSampler{2}(
+                    pixel_filter = PixelFilters.smooth
+                ),
+                n_mips = 1
+            )
+            (t, Target(TargetOutput(tex=t), nothing))
+        end...,
 
         -1.0f0,
         Vector{Texture}()
@@ -183,6 +205,8 @@ function Base.close(runner::GuiRunner)
     exists(runner.algorithm_state) && close(runner.algorithm_state, runner.algorithm)
     foreach(close, runner.textures_to_destroy)
     close(runner.render_3D_assets)
+    close(runner.visualized_shadowmap_target)
+    close(runner.visualized_shadowmap)
 
     if runner.rendering[1] isa Val{2}
         close(runner.rendering[1])
@@ -284,7 +308,7 @@ function update_gui_runner_texture_2D(runner::GuiRunner)
 end
 
 function update_gui_runner_render_3D(runner::GuiRunner, rerender_view::Bool)
-    (_, scene::Render3D.Scene, viewport::Render3D.Viewport) = runner.rendering
+    (_, scene::Render3D.Scene, viewport::Render3D.FullViewport) = runner.rendering
 
     # Get a 3D view of the grid.
     grid_slice = runner.algorithm_state.grid[]
@@ -444,21 +468,29 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
     foreach(close, runner.textures_to_destroy)
     empty!(runner.textures_to_destroy)
 
+    runner.elapsed_seconds += delta_seconds
+
     # Update the 3D renderer if applicable.
     if runner.rendering[1] isa Val{3}
         (_, scene_3D, viewport_3D) = runner.rendering
 
-        Render3D.tick_scene!(scene_3D, delta_seconds)
+        Render3D.tick_scene!(scene_3D, delta_seconds, runner.render_3D_assets)
         Render3D.render(runner.render_3D_assets, scene_3D, viewport_3D)
     end
 
     function render_settings_window_fn()
-        Render3D.scene_settings_gui!(runner.rendering[2])
-        Render3D.viewport_settings_gui!(runner.rendering[3], runner.rendering[2])
+        if runner.rendering[1] isa Val{2}
+            CImGui.Text("No 2D settings")
+        elseif runner.rendering[1] isa Val{3}
+            Render3D.scene_settings_gui!(runner.rendering[2])
+            Render3D.viewport_settings_gui!(runner.rendering[3], runner.rendering[2])
 
-        # Remember the current settings.
-        runner.memory.render3D_sun_dir = runner.rendering[2].sun_dir
-        runner.memory.render3D_sun_color = runner.rendering[2].sun_color_hdr
+            # Remember the current settings.
+            runner.memory.render3D_sun_dir = runner.rendering[2].sun_dir
+            runner.memory.render3D_sun_color = runner.rendering[2].sun_color_hdr
+        else
+            error("Unhandled: ", typeof(runner.rendering))
+        end
     end
     if runner.render_settings_are_open
         if runner.reset_render_settings_window
@@ -500,13 +532,16 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
                         sun_dir = runner.memory.render3D_sun_dir,
                         sun_color = runner.memory.render3D_sun_color
                     ),
-                    Render3D.Viewport(v2i(1200, 1200), v3f(3, 3, 3))
+                    Render3D.FullViewport(v2i(1200, 1200), v3f(3, 3, 3))
                 )
-                (_, scene::Render3D.Scene, viewport::Render3D.Viewport) = runner.rendering
+                (_, scene::Render3D.Scene, viewport::Render3D.FullViewport) = runner.rendering
 
                 update_gui_runner_render_3D(runner, true)
             end
         elseif runner.rendering[1] isa Val{3}
+            @markovjunior_debug(gui_with_style(CImGui.LibCImGui.ImGuiCol_Button, GUI_DEBUG_COLOR) do
+                @c CImGui.Checkbox("Display sun shadowmap", &runner.visualize_shadowmap_instead)
+            end)
             if CImGui.Button("Switch to 2D", v2f(100, 27))
                 # Close the 3D renderer.
                 (_, scene, viewport) = runner.rendering
@@ -546,7 +581,36 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
                 (convert(v2f, tex.size.xy), tex, false)
             elseif runner.rendering[1] isa Val{3}
                 (_, scene_3D, viewport_3D) = runner.rendering
-                (convert(v2f, viewport_3D.view_color.size.xy), viewport_3D.view_color, true)
+                if runner.visualize_shadowmap_instead
+                    # Update the visualization texture if needed.
+                    if runner.visualized_shadowmap.size.xy != scene_3D.sun_pov.view_depth.size.xy
+                        close(runner.visualized_shadowmap_target)
+                        close(runner.visualized_shadowmap)
+                        runner.visualized_shadowmap = Texture(
+                            runner.visualized_shadowmap.format,
+                            scene_3D.sun_pov.view_depth.size.xy,
+                            sampler = convert(TexSampler{2}, runner.visualized_shadowmap.sampler),
+                            n_mips = 1
+                        )
+                        runner.visualized_shadowmap_target = Target(
+                            TargetOutput(tex=runner.visualized_shadowmap),
+                            nothing
+                        )
+                    end
+                    # Regenerate the visualization.
+                    target_activate(runner.visualized_shadowmap_target)
+                    target_clear(runner.visualized_shadowmap_target, v4f(0, 0, 0, 1))
+                    Render3D.visualize_depth_tex(runner.render_3D_assets,
+                                                 scene_3D.sun_pov.view_depth,
+                                                 Box2Df(min=zero(v2f), size=one(v2f)),
+                                                 runner.elapsed_seconds)
+                    target_activate(nothing)
+
+                    dp_out = runner.visualized_shadowmap
+                    (convert(v2f, dp_out.size.xy), dp_out, true)
+                else
+                    (convert(v2f, viewport_3D.view_color.size.xy), viewport_3D.view_color, true)
+                end
             else
                 error("Unhandled: ", typeof(runner.rendering))
             end
@@ -815,11 +879,12 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
         end end end
 
         # Debug widgets:
-        if @markovjunior_debug()
+        @markovjunior_debug begin
             CImGui.Separator()
             CImGui.Dummy(1, 50)
             CImGui.Separator(); CImGui.SameLine(30); CImGui.Text("DEBUG")
-            gui_with_style(CImGui.LibCImGui.ImGuiCol_Button, v3f(0.2, 0.2, 0.2)) do
+
+            gui_with_style(CImGui.LibCImGui.ImGuiCol_Button, GUI_DEBUG_COLOR) do
                 render_tex = if runner.rendering[1] isa Val{2}
                     runner.rendering[3]
                 elseif runner.rendering[1] isa Val{3}
@@ -829,31 +894,56 @@ function gui_main(runner::GuiRunner, delta_seconds::Float32)
                 end
 
                 if CImGui.Button("Recompile Shaders", (200, 30))
-                    new_ones = try
-                        Render3D.App()
+                    try
+                        Render3D.recompile_shaders!(runner.render_3D_assets)
                     catch e
                         runner.algorithm_error_msg = sprint(showerror, e)
                         nothing
                     end
-                    if exists(new_ones)
-                        close(runner.render_3D_assets)
-                        runner.render_3D_assets = new_ones
-                    end
                 end
-
+                if CImGui.GetContentRegionAvailWidth() > 460
+                    CImGui.SameLine(0, 40)
+                end
                 if CImGui.Button("Log GUI draw calls", (200, 30))
                     println(stderr, "LOGGING WITH RENDER TEX ID ",
                             gui_tex_handle(render_tex))
                     service_GUI().debug_log_render_commands = true
                 end
 
-                if CImGui.Button("Log center-pixel of render", (300, 30))
+                if CImGui.Button("Log center-pixel of render", (230, 30))
                     values = fill(zero(v4f), 1, 1)
                     pixel_pos = round(v2u, render_tex.size.xy / 2)
                     get_tex_color(render_tex, values, TexSubset(
                         Box(center=pixel_pos, size=one(v2u))
                     ))
                     println(stderr, "Render at pixel ", pixel_pos, ": ", values[1, 1])
+                end
+                if CImGui.GetContentRegionAvailWidth() > 500
+                    CImGui.SameLine(0, 20)
+                end
+                if (runner.rendering[1] isa Val{3}) && CImGui.Button("Log some sun-shadowmap pixels", (230, 30))
+                    println(stderr, "Depth at shadowmap pixels:")
+                    values = fill(zero(Float32), 1, 1)
+                    for p in (render_tex.size.xy * 0.1, render_tex.size.xy * 0.5, render_tex.size.xy * 0.9)
+                        pixel_pos = round(v2u, p)
+                        get_tex_depth(
+                            runner.rendering[2].sun_pov.view_depth,
+                            values,
+                            TexSubset(Box(center=pixel_pos, size=one(v2u)))
+                        )
+                        println(stderr, "\t", pixel_pos, " = ", values[1, 1])
+                    end
+                end
+            end
+
+            if runner.rendering[1] isa Val{3}
+                CImGui.Text("Sun Shadowmap matrix: World=>UV")
+                gui_with_indentation() do
+                    m = runner.rendering[2].sun_shadowmap_world_to_texel
+                    CImGui.InputFloat4("##SunShadowmapRow1", Ref(v4f(m[1, :]...)))
+                    CImGui.InputFloat4("##SunShadowmapRow2", Ref(v4f(m[2, :]...)))
+                    CImGui.InputFloat4("##SunShadowmapRow3", Ref(v4f(m[3, :]...)))
+                    CImGui.InputFloat4("##SunShadowmapRow4", Ref(v4f(m[4, :]...)))
                 end
             end
         end

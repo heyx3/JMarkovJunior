@@ -81,7 +81,6 @@ include("op_rewrite.jl")
 include("op_draw_box.jl")
 include("op_sequence.jl")
 include("bias_temperatue.jl")
-include("new_runner.jl")
 export AbstractMarkovAllocator, AbstractMarkovBias, AbstractMarkovOp,
        MarkovAlgorithm, MarkovAlgoState, MarkovOpContext,
        markov_op_min_dimension, markov_algo_grid, markov_algo_n_iterations,

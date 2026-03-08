@@ -145,8 +145,18 @@ void main() {
         -u_data.sun_dir, u_data.sun_color,
         albedo, metallic, roughness
     );
+    float shadowMask = computeShadows(
+        o_gridPosF, u_data.sun_dir,
+        sampler2DShadow(u_data.sun_shadowmap), u_data.sun_shadowmap_mat_world_to_texel,
+        u_data.shadowmap_world_bias
+    );
 
-    outColor = vec4(litColor, 1);
+    outColor = vec4(litColor * shadowMask, 1);
+
+    //DEBUG: Viz data.
+    // outColor = vec4(0, 0, 0, 1);
+    // vec4 smTexel4 = u_data.sun_shadowmap_mat_world_to_texel * vec4(o_gridPosF, 1);
+    // outColor.rg = smTexel4.xy / smTexel4.w;
 
 #endif
 }
